@@ -1,0 +1,75 @@
+name: build-and-publish
+
+# 触发时机：
+#  - schedule：每天定时跑，自动检查并同步上游更新
+#  - workflow_dispatch：在 GitHub 网页上手动点一下立即构建
+#  - push：你往 fork 的 main 推代码时也会构建
+on:
+  schedule:
+    # 每天 UTC 03:00（北京时间 11:00）检查上游更新
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write      # 用于把上游更新同步回 fork
+  packages: write      # 用于推送镜像到 GHCR
+
+env:
+  # 镜像名：ghcr.io/<你的GitHub用户名>/genshintools
+  IMAGE_NAME: ${{ github.repository_owner }}/genshintools
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史才能和上游做 merge 比较
+          fetch-depth: 0
+          # 用带写权限的 token，才能把同步提交推回 fork
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- 同步上游（仅定时/手动触发时执行，避免 push 触发时死循环）----
+      - name: Sync from upstream
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Anyrainel/GenshinTools.git || true
+          git fetch upstream main
+          # 如果上游有新提交，就合并；[skip ci] 避免这次合并再触发一遍构建
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse upstream/main)" ]; then
+            git merge upstream/main --no-edit -m "chore: sync upstream [skip ci]" || {
+              echo "上游合并有冲突，跳过本次自动同步，请手动处理"; exit 0;
+            }
+            git push origin HEAD:main || echo "推送失败（可能无变化）"
+          else
+            echo "已是最新，无需同步"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 飞牛NAS 基本是 x86_64；如你的机器是 ARM，改成 linux/amd64,linux/arm64
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # 复用 GitHub 的构建缓存，加速后续构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
